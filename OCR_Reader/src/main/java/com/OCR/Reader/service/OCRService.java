@@ -7,6 +7,6 @@ import java.util.List;
 
 public interface OCRService {
 
-	OCRResult processImage(MultipartFile file, List<String> keys);
+	OCRResult processImage(MultipartFile file, List<String> keys, int columnCount);
 
 }

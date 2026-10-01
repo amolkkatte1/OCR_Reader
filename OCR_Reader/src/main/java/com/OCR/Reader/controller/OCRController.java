@@ -19,9 +19,9 @@ public class OCRController {
 
 	// Endpoint for image upload and OCR processing
 	@PostMapping(value = "/extract", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-	public OCRResult processImage(@RequestParam("image") MultipartFile file, @RequestParam("keys") List<String> keys) {
+	public OCRResult processImage(@RequestParam("image") MultipartFile file, @RequestParam("keys") List<String> keys,@RequestParam("keys") Integer columnCount) {
 
-		return ocrService.processImage(file, keys);
+		return ocrService.processImage(file, keys,columnCount);
 	}
 
 	@GetMapping("/")
