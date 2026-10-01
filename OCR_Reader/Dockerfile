@@ -53,7 +53,7 @@ FROM eclipse-temurin:17-jre
 WORKDIR /app
 
 # ============================================================
-# Install Tesseract OCR + English + Hindi
+# Install Tesseract OCR
 # ============================================================
 
 RUN apt-get update && \
@@ -61,8 +61,8 @@ RUN apt-get update && \
         tesseract-ocr \
         tesseract-ocr-eng \
         tesseract-ocr-hin \
-        liblept5 \
-        libtesseract5 && \
+        libtesseract-dev \
+        libleptonica-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================
@@ -72,22 +72,23 @@ RUN apt-get update && \
 RUN tesseract --version
 
 # ============================================================
-# Verify English and Hindi language files
+# Verify available languages
 # ============================================================
 
 RUN tesseract --list-langs
 
 # ============================================================
-# Verify traineddata files
+# Verify English and Hindi traineddata
 # ============================================================
 
-RUN find /usr/share -name "eng.traineddata" -o -name "hin.traineddata"
+RUN test -f /usr/share/tesseract-ocr/5/tessdata/eng.traineddata && \
+    test -f /usr/share/tesseract-ocr/5/tessdata/hin.traineddata
 
 # ============================================================
 # Copy Spring Boot JAR
 # ============================================================
 
-COPY --from=builder /app/target/OCR_Reader-0.0.1-SNAPSHOT.jar app.jar
+COPY --from=builder /app/target/OCR_Reader-0.0.1-SNAPSHOT.jar /app/app.jar
 
 # ============================================================
 # Application port
@@ -101,11 +102,15 @@ EXPOSE 8088
 
 ENV APP_ENV=default
 
+# ============================================================
 # Tesseract tessdata path
+# ============================================================
+
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 ENV TESSDATA_PATH=/usr/share/tesseract-ocr/5/tessdata
 
 # ============================================================
-# Start Spring Boot
+# Start Spring Boot application
 # Render provides PORT dynamically
 # ============================================================
 
