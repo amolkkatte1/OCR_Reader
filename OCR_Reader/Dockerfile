@@ -114,4 +114,4 @@ ENV TESSDATA_PATH=/usr/share/tesseract-ocr/5/tessdata
 # Render provides PORT dynamically
 # ============================================================
 
-CMD ["sh", "-c", "java -Xmx1024m -jar /app/app.jar --server.port=${PORT:-8088}"]
+CMD ["sh", "-c", "java -Xmx2048m -jar /app/app.jar --server.port=${PORT:-8088}"]
