@@ -1,7 +1,12 @@
 package com.OCR.Reader.service.impl;
 
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -9,6 +14,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.ImageOutputStream;
 
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -24,1051 +35,1467 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class OCRServiceImpl implements OCRService {
 
-    private static final Pattern NUMBER_PATTERN = Pattern.compile("[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)");
+	/*
+	 * ============================================================ IMAGE
+	 * CONFIGURATION ============================================================
+	 */
 
-    @Override
-    public OCRResult processImage(MultipartFile file, List<String> keys, int columnCount) {
+	/**
+	 * Maximum processed image size.
+	 *
+	 * 500 KB = 500 * 1024 bytes
+	 */
+	private static final long MAX_IMAGE_SIZE = 500L * 1024L;
 
-        OCRResult result = new OCRResult();
+	/**
+	 * Maximum width/height used before OCR.
+	 *
+	 * Large mobile/scanner images can consume a lot of memory.
+	 */
+	private static final int MAX_IMAGE_WIDTH = 2500;
 
-        File tempFile = null;
+	private static final int MAX_IMAGE_HEIGHT = 2500;
 
-        try {
+	/**
+	 * JPEG quality range.
+	 */
+	private static final float MAX_JPEG_QUALITY = 0.90f;
 
-            if (file == null || file.isEmpty()) {
+	private static final float MIN_JPEG_QUALITY = 0.35f;
 
-                result.setStatus(AppConstants.ERROR);
+	private static final float JPEG_QUALITY_STEP = 0.05f;
 
-                return result;
-            }
+	/**
+	 * Number pattern used for extracting values.
+	 */
+	private static final Pattern NUMBER_PATTERN = Pattern.compile("[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)");
 
-            if (keys == null || keys.isEmpty()) {
+	@Override
+	public OCRResult processImage(MultipartFile file, List<String> keys, int columnCount) {
 
-                result.setStatus(AppConstants.ERROR);
+		OCRResult result = new OCRResult();
 
-                return result;
-            }
+		File tempFile = null;
 
-            if (columnCount < 1) {
-                columnCount = 1;
-            }
+		try {
 
-            //log.info("==================================================");
+			/*
+			 * ======================================================== VALIDATION
+			 * ========================================================
+			 */
 
-            //log.info("OCR PROCESSING STARTED");
+			if (file == null || file.isEmpty()) {
 
-            //log.info("Column Count: {}", columnCount);
+				result.setStatus(AppConstants.ERROR);
 
-            //log.info("Requested Keys: {}", keys);
+				return result;
+			}
 
-            //log.info("==================================================");
+			if (keys == null || keys.isEmpty()) {
 
-            tempFile = File.createTempFile("ocr", ".tmp");
+				result.setStatus(AppConstants.ERROR);
 
-            file.transferTo(tempFile);
+				return result;
+			}
 
-            OCRProcessor ocrProcessor = new OCRProcessor();
+			if (columnCount < 1) {
 
-            String extractedText = ocrProcessor.extractTextFromImage(tempFile);
+				columnCount = 1;
+			}
 
-            //log.info("OCR TEXT:\n{}", extractedText);
+			/*
+			 * ======================================================== CREATE PROCESSED
+			 * TEMP IMAGE
+			 *
+			 * Every request gets its own unique temporary file.
+			 *
+			 * Therefore multiple requests can run simultaneously.
+			 * ========================================================
+			 */
 
-            Map<String, String> keyValues = extractKeyValues(extractedText, keys, columnCount);
+			tempFile = File.createTempFile("ocr_processed_", ".jpg");
 
-            result.setData(keyValues);
+			/*
+			 * ======================================================== RESIZE + COMPRESS
+			 * IMAGE
+			 *
+			 * Original uploaded image is NOT modified.
+			 *
+			 * OCR uses only the processed image.
+			 * ========================================================
+			 */
 
-            result.setStatus(AppConstants.SUCCESS);
+			processAndSaveImage(file, tempFile);
 
-            //log.info("FINAL OCR RESULT: {}", keyValues);
+			log.debug("Processed OCR image: {} KB, dimensions: {}x{}", tempFile.length() / 1024,
+					getImageWidth(tempFile), getImageHeight(tempFile));
 
-        } catch (IOException e) {
+			/*
+			 * ======================================================== OCR
+			 *
+			 * New OCRProcessor per request.
+			 *
+			 * No synchronization / locking is used.
+			 *
+			 * Multiple requests can execute simultaneously.
+			 * ========================================================
+			 */
 
-            log.error("Error while processing OCR image", e);
+			OCRProcessor ocrProcessor = new OCRProcessor();
 
-            result.setStatus(AppConstants.ERROR);
+			String extractedText = ocrProcessor.extractTextFromImage(tempFile);
 
-        } catch (Exception e) {
+			/*
+			 * ======================================================== EXTRACT KEY VALUES
+			 * ========================================================
+			 */
 
-            log.error("Unexpected OCR error", e);
+			Map<String, String> keyValues = extractKeyValues(extractedText, keys, columnCount);
 
-            result.setStatus(AppConstants.ERROR);
+			result.setData(keyValues);
 
-        } finally {
+			result.setStatus(AppConstants.SUCCESS);
 
-            if (tempFile != null && tempFile.exists()) {
+		} catch (IOException e) {
 
-                if (!tempFile.delete()) {
+			log.error("Error while processing OCR image", e);
 
-                    log.warn("Unable to delete temp file: {}", tempFile.getAbsolutePath());
-                }
-            }
-        }
+			result.setStatus(AppConstants.ERROR);
 
-        return result;
-    }
+		} catch (Exception e) {
 
-    /*
-     * ============================================================ MAIN EXTRACTION
-     * ============================================================
-     */
+			log.error("Unexpected OCR error", e);
 
-    private Map<String, String> extractKeyValues(String extractedText, List<String> keys, int columnCount) {
+			result.setStatus(AppConstants.ERROR);
 
-        Map<String, String> result = new LinkedHashMap<>();
+		} finally {
 
-        if (extractedText == null || extractedText.isBlank() || keys == null || keys.isEmpty()) {
+			/*
+			 * ======================================================== DELETE PROCESSED
+			 * IMAGE
+			 *
+			 * This executes whether OCR succeeds or fails.
+			 * ========================================================
+			 */
 
-            return result;
-        }
+			deleteTempFile(tempFile);
+		}
 
-        List<String> cleanedKeys = cleanKeys(keys);
+		return result;
+	}
 
-        if (cleanedKeys.isEmpty()) {
-            return result;
-        }
+	/*
+	 * ============================================================ IMAGE PROCESSING
+	 * ============================================================
+	 */
 
-        String text = normalizeOCRText(extractedText);
+	/**
+	 * Reads the uploaded image, adjusts its dimensions and compresses it to a
+	 * maximum of approximately 500 KB.
+	 *
+	 * The original MultipartFile is never modified.
+	 */
+	private void processAndSaveImage(MultipartFile multipartFile, File outputFile) throws IOException {
 
-        String[] lines = text.split("\\r?\\n");
+		BufferedImage originalImage;
 
-        /*
-         * -------------------------------------------------------- IMPORTANT
-         *
-         * Every requested key searches ALL columns.
-         *
-         * Example:
-         *
-         * columnCount = 3
-         *
-         * WBC 7.2 HGB 13.5 RBC 4.27
-         *
-         * WBC -> column 1 HGB -> column 2 RBC -> column 3
-         *
-         * But we do NOT assume this.
-         *
-         * Every key searches:
-         *
-         * column 1 column 2 column 3
-         *
-         * --------------------------------------------------------
-         */
+		/*
+		 * ------------------------------------------------------------ Read uploaded
+		 * image ------------------------------------------------------------
+		 */
 
-        for (String key : cleanedKeys) {
+		try (InputStream inputStream = multipartFile.getInputStream()) {
 
-            if (result.containsKey(key)) {
-                continue;
-            }
+			originalImage = ImageIO.read(inputStream);
+		}
 
-            String value = findKeyInAllColumns(key, lines, cleanedKeys, columnCount);
+		if (originalImage == null) {
 
-            if (value != null && !value.isBlank()) {
+			throw new IOException("Unable to read uploaded image");
+		}
 
-                result.put(key, value);
+		int originalWidth = originalImage.getWidth();
 
-                //log.info("FOUND -> {} = {}", key, value);
-            } else {
+		int originalHeight = originalImage.getHeight();
 
-                log.warn("NOT FOUND -> {}", key);
-            }
-        }
+		log.debug("Original image dimensions: {}x{}", originalWidth, originalHeight);
 
-        /*
-         * Final fallback for values that appear on the following OCR line.
-         */
-        extractValuesFromNextLines(lines, cleanedKeys, result);
+		/*
+		 * ------------------------------------------------------------ Calculate
+		 * resized dimensions.
+		 *
+		 * Aspect ratio is preserved.
+		 * ------------------------------------------------------------
+		 */
 
-        return result;
-    }
+		Dimension dimension = calculateDimensions(originalWidth, originalHeight);
 
-    /*
-     * ============================================================ SEARCH KEY IN
-     * ALL COLUMNS ============================================================
-     */
+		BufferedImage resizedImage = resizeImage(originalImage, dimension.width, dimension.height);
 
-    private String findKeyInAllColumns(String key, String[] lines, List<String> allKeys, int columnCount) {
+		/*
+		 * ------------------------------------------------------------ Compress to <=
+		 * 500 KB. ------------------------------------------------------------
+		 */
 
-        if (key == null || key.isBlank() || lines == null) {
+		compressToTargetSize(resizedImage, outputFile);
 
-            return null;
-        }
+		/*
+		 * ------------------------------------------------------------ Safety check
+		 * ------------------------------------------------------------
+		 */
 
-        /*
-         * Search every OCR line.
-         */
-        for (String line : lines) {
+		if (outputFile.length() > MAX_IMAGE_SIZE) {
 
-            if (line == null || line.isBlank()) {
+			log.warn("Processed image is still larger than 500 KB: {} KB", outputFile.length() / 1024);
+		} else {
 
-                continue;
-            }
+			log.debug("Processed image size: {} KB", outputFile.length() / 1024);
+		}
 
-            /*
-             * Create exactly the logical columns from this OCR line.
-             */
-            List<String> columns = createColumns(line, allKeys, columnCount);
+		/*
+		 * Release image resources.
+		 */
+		originalImage.flush();
 
-            log.debug("OCR LINE: [{}]", line);
+		resizedImage.flush();
+	}
 
-            log.debug("COLUMNS: {}", columns);
+	/*
+	 * ============================================================ CALCULATE
+	 * DIMENSIONS ============================================================
+	 */
 
-            /*
-             * SEARCH KEY IN EVERY COLUMN
-             */
-            for (int i = 0; i < columns.size(); i++) {
+	/**
+	 * Keeps the original aspect ratio.
+	 *
+	 * Example:
+	 *
+	 * 4000 x 3000
+	 *
+	 * becomes approximately:
+	 *
+	 * 2500 x 1875
+	 */
+	private Dimension calculateDimensions(int originalWidth, int originalHeight) {
 
-                String column = columns.get(i);
+		if (originalWidth <= MAX_IMAGE_WIDTH && originalHeight <= MAX_IMAGE_HEIGHT) {
 
-                if (column == null || column.isBlank()) {
+			return new Dimension(originalWidth, originalHeight);
+		}
 
-                    continue;
-                }
+		double widthRatio = (double) MAX_IMAGE_WIDTH / originalWidth;
 
-                log.debug("Searching key [{}] in column {} -> [{}]", key, i + 1, column);
+		double heightRatio = (double) MAX_IMAGE_HEIGHT / originalHeight;
 
-                String value = extractValueFromColumn(column, key, allKeys);
+		double ratio = Math.min(widthRatio, heightRatio);
 
-                if (value != null && !value.isBlank()) {
+		int newWidth = Math.max(1, (int) Math.round(originalWidth * ratio));
 
-                    //log.info("KEY [{}] FOUND IN COLUMN {} -> {}", key, i + 1, value);
+		int newHeight = Math.max(1, (int) Math.round(originalHeight * ratio));
 
-                    return value;
-                }
-            }
-        }
+		return new Dimension(newWidth, newHeight);
+	}
 
-        /*
-         * -------------------------------------------------------- COMPLETE LINE
-         * FALLBACK --------------------------------------------------------
-         *
-         * Example:
-         *
-         * WBC 7.2 HGB 13.5 RBC 4.27
-         *
-         * If column detection fails, search the complete OCR line.
-         */
-        for (String line : lines) {
+	/*
+	 * ============================================================ RESIZE IMAGE
+	 * ============================================================
+	 */
 
-            if (line == null || line.isBlank()) {
+	private BufferedImage resizeImage(BufferedImage originalImage, int width, int height) {
 
-                continue;
-            }
+		/*
+		 * TYPE_INT_RGB is intentional because final OCR image is stored as JPEG.
+		 *
+		 * This also removes alpha/transparency.
+		 */
 
-            String value = extractValueFromColumn(line, key, allKeys);
+		BufferedImage resizedImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
 
-            if (value != null && !value.isBlank()) {
+		Graphics2D graphics = resizedImage.createGraphics();
 
-                //log.info("KEY [{}] FOUND IN COMPLETE LINE -> {}", key, value);
+		try {
 
-                return value;
-            }
-        }
+			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
-        return null;
-    }
+			graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
 
-    /*
-     * ============================================================ CREATE COLUMNS
-     * ============================================================
-     *
-     * Example:
-     *
-     * WBC 7.2 HGB 13.5 RBC 4.27
-     *
-     * columnCount = 3
-     *
-     * Result:
-     *
-     * [ "WBC 7.2", "HGB 13.5", "RBC 4.27" ]
-     *
-     * ============================================================
-     */
+			graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
-    private List<String> createColumns(String line, List<String> keys, int columnCount) {
+			graphics.drawImage(originalImage, 0, 0, width, height, null);
 
-        List<String> columns = new ArrayList<>();
+		} finally {
 
-        if (line == null || line.isBlank()) {
+			graphics.dispose();
+		}
 
-            return columns;
-        }
+		return resizedImage;
+	}
 
-        String text = line.trim();
+	/*
+	 * ============================================================ COMPRESS IMAGE
+	 * TO 500 KB ============================================================
+	 */
 
-        if (columnCount <= 1) {
+	private void compressToTargetSize(BufferedImage image, File outputFile) throws IOException {
 
-            columns.add(text);
+		/*
+		 * Start with high quality.
+		 */
+		float quality = MAX_JPEG_QUALITY;
 
-            return columns;
-        }
+		byte[] compressedData = null;
 
-        /*
-         * -------------------------------------------------------- FIRST METHOD
-         *
-         * Find all requested keys in the line.
-         *
-         * Example:
-         *
-         * WBC 7.2 HGB 13.5 RBC 4.27
-         *
-         * Positions:
-         *
-         * WBC -> 0 HGB -> ... RBC -> ...
-         *
-         * Create a column from one key to the next key.
-         * --------------------------------------------------------
-         */
+		/*
+		 * ------------------------------------------------------------ First try
+		 * different JPEG qualities.
+		 * ------------------------------------------------------------
+		 */
 
-        List<KeyPosition> positions = findAllKeyPositions(text, keys);
+		while (quality >= MIN_JPEG_QUALITY) {
 
-        positions.sort(Comparator.comparingInt(KeyPosition::getIndex));
+			byte[] data = encodeJpeg(image, quality);
 
-        List<KeyPosition> uniquePositions = removeDuplicatePositions(positions);
+			if (data.length <= MAX_IMAGE_SIZE) {
 
-        if (!uniquePositions.isEmpty()) {
+				compressedData = data;
 
-            for (int i = 0; i < uniquePositions.size(); i++) {
+				log.debug("Image compressed successfully. Quality={}, Size={} KB", quality, data.length / 1024);
 
-                int start = uniquePositions.get(i).getIndex();
+				break;
+			}
 
-                int end = text.length();
+			quality -= JPEG_QUALITY_STEP;
+		}
 
-                if (i + 1 < uniquePositions.size()) {
+		/*
+		 * ------------------------------------------------------------ If quality alone
+		 * was not enough, reduce dimensions.
+		 * ------------------------------------------------------------
+		 */
 
-                    end = uniquePositions.get(i + 1).getIndex();
-                }
+		if (compressedData == null) {
 
-                if (start >= end) {
-                    continue;
-                }
+			int width = image.getWidth();
 
-                String column = text.substring(start, end).trim();
+			int height = image.getHeight();
 
-                if (!column.isEmpty()) {
+			BufferedImage currentImage = image;
 
-                    columns.add(column);
-                }
-            }
+			while (compressedData == null) {
 
-            /*
-             * If we found the expected number of columns, return them.
-             */
-            if (columns.size() == columnCount) {
+				width = Math.max(800, (int) (width * 0.85));
 
-                return columns;
-            }
+				height = Math.max(800, (int) (height * 0.85));
 
-            /*
-             * If fewer columns were detected, continue with whitespace fallback.
-             */
-        }
+				/*
+				 * Prevent infinite loop.
+				 */
+				if (width == currentImage.getWidth() && height == currentImage.getHeight()) {
 
-        /*
-         * -------------------------------------------------------- SECOND METHOD
-         *
-         * OCR normally puts large spaces between columns.
-         *
-         * Example:
-         *
-         * WBC 7.2 HGB 13.5 RBC 4.27
-         *
-         * Split on 3 or more spaces.
-         * --------------------------------------------------------
-         */
+					break;
+				}
 
-        columns.clear();
+				BufferedImage resized = resizeImage(currentImage, width, height);
 
-        String[] spaceColumns = text.split("\\s{3,}");
+				/*
+				 * Try quality from high to low again.
+				 */
+				quality = MAX_JPEG_QUALITY;
 
-        for (String column : spaceColumns) {
+				while (quality >= MIN_JPEG_QUALITY) {
 
-            if (column != null && !column.isBlank()) {
+					byte[] data = encodeJpeg(resized, quality);
 
-                columns.add(column.trim());
-            }
-        }
+					if (data.length <= MAX_IMAGE_SIZE) {
 
-        if (columns.size() == columnCount) {
+						compressedData = data;
 
-            return columns;
-        }
+						log.debug(
+								"Image compressed after dimension reduction. "
+										+ "Dimensions={}x{}, Quality={}, Size={} KB",
+								width, height, quality, data.length / 1024);
 
-        /*
-         * -------------------------------------------------------- THIRD METHOD
-         *
-         * If OCR has inconsistent spacing, use the detected key positions again.
-         *
-         * We don't assign a key to a fixed column. We simply return all detected key
-         * groups. --------------------------------------------------------
-         */
+						break;
+					}
 
-        if (!uniquePositions.isEmpty()) {
+					quality -= JPEG_QUALITY_STEP;
+				}
 
-            columns.clear();
+				/*
+				 * Release previous intermediate image.
+				 */
+				if (currentImage != image) {
 
-            for (int i = 0; i < uniquePositions.size(); i++) {
+					currentImage.flush();
+				}
 
-                int start = uniquePositions.get(i).getIndex();
+				currentImage = resized;
 
-                int end = text.length();
+				/*
+				 * Final emergency condition.
+				 */
+				if (width <= 800 && height <= 800) {
 
-                if (i + 1 < uniquePositions.size()) {
+					if (compressedData == null) {
 
-                    end = uniquePositions.get(i + 1).getIndex();
-                }
+						byte[] data = encodeJpeg(currentImage, MIN_JPEG_QUALITY);
 
-                String column = text.substring(start, end).trim();
+						compressedData = data;
+					}
 
-                if (!column.isEmpty()) {
+					currentImage.flush();
 
-                    columns.add(column);
-                }
-            }
+					break;
+				}
+			}
+		}
 
-            return columns;
-        }
+		/*
+		 * ------------------------------------------------------------ Write final
+		 * bytes to file. ------------------------------------------------------------
+		 */
 
-        /*
-         * -------------------------------------------------------- LAST FALLBACK
-         *
-         * Treat complete line as one column.
-         * --------------------------------------------------------
-         */
+		if (compressedData == null) {
 
-        columns.clear();
+			throw new IOException("Unable to compress image to target size");
+		}
 
-        columns.add(text);
+		java.nio.file.Files.write(outputFile.toPath(), compressedData);
 
-        return columns;
-    }
+		/*
+		 * ------------------------------------------------------------ Final size
+		 * check. ------------------------------------------------------------
+		 */
 
-    /*
-     * ============================================================ EXTRACT VALUE
-     * FROM COLUMN ============================================================
-     */
+		if (outputFile.length() > MAX_IMAGE_SIZE) {
 
-    private String extractValueFromColumn(String column, String requestedKey, List<String> allKeys) {
+			log.warn("Unable to reduce image below 500 KB. Final size={} KB", outputFile.length() / 1024);
+		}
+	}
 
-        if (column == null || column.isBlank() || requestedKey == null || requestedKey.isBlank()) {
+	/*
+	 * ============================================================ JPEG ENCODING
+	 * ============================================================
+	 */
 
-            return null;
-        }
+	private byte[] encodeJpeg(BufferedImage image, float quality) throws IOException {
 
-        /*
-         * Find the actual key position.
-         */
-        KeyMatch keyMatch = findKeyMatch(column, requestedKey);
+		ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
 
-        if (keyMatch == null) {
+		ImageWriter writer = null;
 
-            return null;
-        }
+		ImageOutputStream imageOutputStream = null;
 
-        /*
-         * IMPORTANT:
-         *
-         * Use actual OCR end position.
-         *
-         * DO NOT use:
-         *
-         * key.length()
-         */
-        int valueStart = keyMatch.getEndIndex();
+		try {
 
-        if (valueStart >= column.length()) {
+			writer = ImageIO.getImageWritersByFormatName("jpg").next();
 
-            return null;
-        }
+			imageOutputStream = ImageIO.createImageOutputStream(outputStream);
 
-        String valuePart = column.substring(valueStart);
+			writer.setOutput(imageOutputStream);
 
-        /*
-         * Find next requested key.
-         *
-         * This prevents taking numbers belonging to the next test.
-         */
-        KeyMatch nextKey = findNextKey(valuePart, allKeys);
+			ImageWriteParam writeParam = writer.getDefaultWriteParam();
 
-        if (nextKey != null) {
+			if (writeParam.canWriteCompressed()) {
 
-            valuePart = valuePart.substring(0, nextKey.getStartIndex());
-        }
+				writeParam.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
 
-        valuePart = cleanValue(valuePart);
+				writeParam.setCompressionQuality(quality);
+			}
 
-        String value = extractNumber(valuePart);
+			writer.write(null, new IIOImage(image, null, null), writeParam);
 
-        if (value != null) {
+			imageOutputStream.flush();
 
-            return value;
-        }
+			return outputStream.toByteArray();
 
-        return null;
-    }
+		} finally {
 
-    /*
-     * ============================================================ FIND KEY MATCH
-     * ============================================================
-     */
+			if (imageOutputStream != null) {
 
-    private KeyMatch findKeyMatch(String text, String key) {
+				imageOutputStream.close();
+			}
 
-        if (text == null || text.isBlank() || key == null || key.isBlank()) {
+			if (writer != null) {
 
-            return null;
-        }
+				writer.dispose();
+			}
 
-        String normalizedText = normalizeForKeyMatching(text);
+			outputStream.close();
+		}
+	}
 
-        String normalizedKey = normalizeForKeyMatching(key);
+	/*
+	 * ============================================================ GET IMAGE WIDTH
+	 * ============================================================
+	 */
 
-        if (normalizedText.isEmpty() || normalizedKey.isEmpty()) {
+	private int getImageWidth(File file) {
 
-            return null;
-        }
+		try {
 
-        int normalizedStart = normalizedText.indexOf(normalizedKey);
+			BufferedImage image = ImageIO.read(file);
 
-        if (normalizedStart < 0) {
+			if (image == null) {
 
-            return null;
-        }
+				return 0;
+			}
 
-        int normalizedEnd = normalizedStart + normalizedKey.length();
+			int width = image.getWidth();
 
-        int originalStart = mapNormalizedIndexToOriginal(text, normalizedStart);
+			image.flush();
 
-        int originalEnd = mapNormalizedEndToOriginal(text, normalizedEnd);
+			return width;
 
-        if (originalStart < 0 || originalEnd < 0) {
+		} catch (Exception e) {
 
-            return null;
-        }
+			return 0;
+		}
+	}
 
-        return new KeyMatch(originalStart, originalEnd, key);
-    }
+	/*
+	 * ============================================================ GET IMAGE HEIGHT
+	 * ============================================================
+	 */
 
-    /*
-     * ============================================================ FIND NEXT KEY
-     * ============================================================
-     */
+	private int getImageHeight(File file) {
 
-    private KeyMatch findNextKey(String text, List<String> allKeys) {
+		try {
 
-        if (text == null || text.isBlank() || allKeys == null || allKeys.isEmpty()) {
+			BufferedImage image = ImageIO.read(file);
 
-            return null;
-        }
+			if (image == null) {
 
-        KeyMatch nearest = null;
+				return 0;
+			}
 
-        for (String key : allKeys) {
+			int height = image.getHeight();
 
-            if (key == null || key.isBlank()) {
+			image.flush();
 
-                continue;
-            }
+			return height;
 
-            KeyMatch match = findKeyMatch(text, key);
+		} catch (Exception e) {
 
-            if (match == null) {
-                continue;
-            }
+			return 0;
+		}
+	}
 
-            if (nearest == null || match.getStartIndex() < nearest.getStartIndex()) {
+	/*
+	 * ============================================================ DELETE TEMP FILE
+	 * ============================================================
+	 */
 
-                nearest = match;
-            }
-        }
+	private void deleteTempFile(File tempFile) {
 
-        return nearest;
-    }
+		if (tempFile == null) {
 
-    /*
-     * ============================================================ FIND ALL KEY
-     * POSITIONS ============================================================
-     */
+			return;
+		}
 
-    private List<KeyPosition> findAllKeyPositions(String text, List<String> keys) {
+		try {
 
-        List<KeyPosition> positions = new ArrayList<>();
+			if (tempFile.exists()) {
 
-        if (text == null || text.isBlank() || keys == null || keys.isEmpty()) {
+				java.nio.file.Files.deleteIfExists(tempFile.toPath());
 
-            return positions;
-        }
+				log.debug("Temporary OCR image deleted: {}", tempFile.getAbsolutePath());
+			}
 
-        for (String key : keys) {
+		} catch (Exception e) {
 
-            if (key == null || key.isBlank()) {
+			log.warn("Unable to delete temporary OCR image: {}", tempFile.getAbsolutePath(), e);
+		}
+	}
 
-                continue;
-            }
+	/*
+	 * ============================================================ MAIN EXTRACTION
+	 * ============================================================
+	 */
 
-            String normalizedText = normalizeForKeyMatching(text);
+	private Map<String, String> extractKeyValues(String extractedText, List<String> keys, int columnCount) {
 
-            String normalizedKey = normalizeForKeyMatching(key);
+		Map<String, String> result = new LinkedHashMap<>();
 
-            int searchFrom = 0;
+		if (extractedText == null || extractedText.isBlank() || keys == null || keys.isEmpty()) {
 
-            while (searchFrom < normalizedText.length()) {
+			return result;
+		}
 
-                int normalizedIndex = normalizedText.indexOf(normalizedKey, searchFrom);
+		List<String> cleanedKeys = cleanKeys(keys);
 
-                if (normalizedIndex < 0) {
+		if (cleanedKeys.isEmpty()) {
 
-                    break;
-                }
+			return result;
+		}
 
-                int originalIndex = mapNormalizedIndexToOriginal(text, normalizedIndex);
+		String text = normalizeOCRText(extractedText);
 
-                if (originalIndex >= 0) {
+		String[] lines = text.split("\\r?\\n");
 
-                    positions.add(new KeyPosition(originalIndex, key));
-                }
+		/*
+		 * Every requested key searches all columns.
+		 */
 
-                searchFrom = normalizedIndex + normalizedKey.length();
-            }
-        }
+		for (String key : cleanedKeys) {
 
-        return positions;
-    }
+			if (result.containsKey(key)) {
 
-    /*
-     * ============================================================ REMOVE DUPLICATE
-     * POSITIONS ============================================================
-     */
+				continue;
+			}
 
-    private List<KeyPosition> removeDuplicatePositions(List<KeyPosition> positions) {
+			String value = findKeyInAllColumns(key, lines, cleanedKeys, columnCount);
 
-        List<KeyPosition> result = new ArrayList<>();
+			if (value != null && !value.isBlank()) {
 
-        int previousIndex = -1;
+				result.put(key, value);
 
-        for (KeyPosition position : positions) {
+			} else {
 
-            if (position.getIndex() == previousIndex) {
+				log.warn("NOT FOUND -> {}", key);
+			}
+		}
 
-                continue;
-            }
+		/*
+		 * Final fallback for values appearing on the following OCR line.
+		 */
 
-            result.add(position);
+		extractValuesFromNextLines(lines, cleanedKeys, result);
 
-            previousIndex = position.getIndex();
-        }
+		return result;
+	}
 
-        return result;
-    }
+	/*
+	 * ============================================================ SEARCH KEY IN
+	 * ALL COLUMNS ============================================================
+	 */
 
-    /*
-     * ============================================================ NEXT LINE
-     * FALLBACK ============================================================
-     */
+	private String findKeyInAllColumns(String key, String[] lines, List<String> allKeys, int columnCount) {
 
-    private void extractValuesFromNextLines(String[] lines, List<String> keys, Map<String, String> result) {
+		if (key == null || key.isBlank() || lines == null) {
 
-        if (lines == null || lines.length == 0) {
+			return null;
+		}
 
-            return;
-        }
+		/*
+		 * Search every OCR line.
+		 */
 
-        for (int i = 0; i < lines.length; i++) {
+		for (String line : lines) {
 
-            String line = lines[i];
+			if (line == null || line.isBlank()) {
 
-            if (line == null || line.isBlank()) {
+				continue;
+			}
 
-                continue;
-            }
+			List<String> columns = createColumns(line, allKeys, columnCount);
 
-            for (String key : keys) {
+			log.debug("OCR LINE: [{}]", line);
 
-                if (result.containsKey(key)) {
-                    continue;
-                }
+			log.debug("COLUMNS: {}", columns);
 
-                KeyMatch keyMatch = findKeyMatch(line, key);
+			/*
+			 * Search key in every column.
+			 */
 
-                if (keyMatch == null) {
+			for (int i = 0; i < columns.size(); i++) {
 
-                    continue;
-                }
+				String column = columns.get(i);
 
-                String afterKey = line.substring(keyMatch.getEndIndex());
+				if (column == null || column.isBlank()) {
 
-                afterKey = cleanValue(afterKey);
+					continue;
+				}
 
-                String value = extractNumber(afterKey);
+				log.debug("Searching key [{}] in column {} -> [{}]", key, i + 1, column);
 
-                if (value != null) {
+				String value = extractValueFromColumn(column, key, allKeys);
 
-                    result.put(key, value);
+				if (value != null && !value.isBlank()) {
 
-                    continue;
-                }
+					return value;
+				}
+			}
+		}
 
-                /*
-                 * Search following lines.
-                 */
-                for (int j = i + 1; j < lines.length; j++) {
+		/*
+		 * Complete line fallback.
+		 */
 
-                    String nextLine = lines[j];
+		for (String line : lines) {
 
-                    if (nextLine == null || nextLine.isBlank()) {
+			if (line == null || line.isBlank()) {
 
-                        continue;
-                    }
+				continue;
+			}
 
-                    /*
-                     * Don't take another key's value.
-                     */
-                    if (containsAnyKey(nextLine, keys)) {
+			String value = extractValueFromColumn(line, key, allKeys);
 
-                        break;
-                    }
+			if (value != null && !value.isBlank()) {
 
-                    value = extractNumber(cleanValue(nextLine));
+				return value;
+			}
+		}
 
-                    if (value != null) {
+		return null;
+	}
 
-                        result.put(key, value);
+	/*
+	 * ============================================================ CREATE COLUMNS
+	 * ============================================================
+	 */
 
-                        //log.info("KEY [{}] VALUE [{}] FOUND ON NEXT LINE", key, value);
+	private List<String> createColumns(String line, List<String> keys, int columnCount) {
 
-                        break;
-                    }
-                }
-            }
-        }
-    }
+		List<String> columns = new ArrayList<>();
 
-    /*
-     * ============================================================ CHECK ANY KEY
-     * ============================================================
-     */
+		if (line == null || line.isBlank()) {
 
-    private boolean containsAnyKey(String line, List<String> keys) {
+			return columns;
+		}
 
-        if (line == null || line.isBlank()) {
+		String text = line.trim();
 
-            return false;
-        }
+		if (columnCount <= 1) {
 
-        for (String key : keys) {
+			columns.add(text);
 
-            if (findKeyMatch(line, key) != null) {
+			return columns;
+		}
 
-                return true;
-            }
-        }
+		/*
+		 * First method: requested key positions.
+		 */
 
-        return false;
-    }
+		List<KeyPosition> positions = findAllKeyPositions(text, keys);
 
-    /*
-     * ============================================================ EXTRACT NUMBER
-     * ============================================================
-     */
+		positions.sort(Comparator.comparingInt(KeyPosition::getIndex));
 
-    private String extractNumber(String text) {
+		List<KeyPosition> uniquePositions = removeDuplicatePositions(positions);
 
-        if (text == null || text.isBlank()) {
+		if (!uniquePositions.isEmpty()) {
 
-            return null;
-        }
+			for (int i = 0; i < uniquePositions.size(); i++) {
 
-        Matcher matcher = NUMBER_PATTERN.matcher(text);
+				int start = uniquePositions.get(i).getIndex();
 
-        if (matcher.find()) {
+				int end = text.length();
 
-            return matcher.group();
-        }
+				if (i + 1 < uniquePositions.size()) {
 
-        return null;
-    }
+					end = uniquePositions.get(i + 1).getIndex();
+				}
 
-    /*
-     * ============================================================ CLEAN VALUE
-     * ============================================================
-     */
+				if (start >= end) {
 
-    private String cleanValue(String value) {
+					continue;
+				}
 
-        if (value == null) {
+				String column = text.substring(start, end).trim();
 
-            return "";
-        }
+				if (!column.isEmpty()) {
 
-        String result = value.trim();
+					columns.add(column);
+				}
+			}
 
-        result = result.replaceFirst("^[\\s:=\\-–—|]+", "").trim();
+			if (columns.size() == columnCount) {
 
-        result = removeLHFlag(result);
+				return columns;
+			}
+		}
 
-        result = result.replaceFirst("^[\\s:=\\-–—|]+", "").trim();
+		/*
+		 * Second method: large whitespace.
+		 */
 
-        return result;
-    }
+		columns.clear();
 
-    /*
-     * ============================================================ REMOVE H / L
-     * FLAG ============================================================
-     */
+		String[] spaceColumns = text.split("\\s{3,}");
 
-    private String removeLHFlag(String text) {
+		for (String column : spaceColumns) {
 
-        if (text == null) {
+			if (column != null && !column.isBlank()) {
 
-            return "";
-        }
+				columns.add(column.trim());
+			}
+		}
 
-        String result = text.trim();
+		if (columns.size() == columnCount) {
 
-        while (true) {
+			return columns;
+		}
 
-            String updated = result.replaceFirst("(?i)^[HL](?:\\s*[:=\\-–—|])?\\s*", "").trim();
+		/*
+		 * Third method: detected key positions.
+		 */
 
-            if (updated.equals(result)) {
+		if (!uniquePositions.isEmpty()) {
 
-                break;
-            }
+			columns.clear();
 
-            result = updated;
-        }
+			for (int i = 0; i < uniquePositions.size(); i++) {
 
-        return result;
-    }
+				int start = uniquePositions.get(i).getIndex();
 
-    /*
-     * ============================================================ NORMALIZE KEY
-     * ============================================================
-     */
+				int end = text.length();
 
-    private String normalizeForKeyMatching(String text) {
+				if (i + 1 < uniquePositions.size()) {
 
-        if (text == null) {
+					end = uniquePositions.get(i + 1).getIndex();
+				}
 
-            return "";
-        }
+				String column = text.substring(start, end).trim();
 
-        /*
-         * These become equivalent:
-         *
-         * LYMPH% LYMPH % LYMPH-%
-         *
-         * RDW-CV RDW CV
-         *
-         * RDWCV
-         */
-        return text.toLowerCase().replaceAll("[\\s\\-_\\%]+", "");
-    }
+				if (!column.isEmpty()) {
 
-    /*
-     * ============================================================ MAP NORMALIZED
-     * START TO ORIGINAL
-     * ============================================================
-     */
+					columns.add(column);
+				}
+			}
 
-    private int mapNormalizedIndexToOriginal(String originalText, int normalizedIndex) {
+			return columns;
+		}
 
-        int normalizedPosition = 0;
+		/*
+		 * Last fallback: complete line.
+		 */
 
-        for (int i = 0; i < originalText.length(); i++) {
+		columns.clear();
 
-            char c = originalText.charAt(i);
+		columns.add(text);
 
-            if (Character.isWhitespace(c) || c == '-' || c == '_' || c == '%') {
+		return columns;
+	}
 
-                continue;
-            }
+	/*
+	 * ============================================================ EXTRACT VALUE
+	 * FROM COLUMN ============================================================
+	 */
 
-            if (normalizedPosition == normalizedIndex) {
+	private String extractValueFromColumn(String column, String requestedKey, List<String> allKeys) {
 
-                return i;
-            }
+		if (column == null || column.isBlank() || requestedKey == null || requestedKey.isBlank()) {
 
-            normalizedPosition++;
-        }
+			return null;
+		}
 
-        return -1;
-    }
+		KeyMatch keyMatch = findKeyMatch(column, requestedKey);
 
-    /*
-     * ============================================================ MAP NORMALIZED
-     * END TO ORIGINAL ============================================================
-     */
+		if (keyMatch == null) {
 
-    private int mapNormalizedEndToOriginal(String originalText, int normalizedEnd) {
+			return null;
+		}
 
-        int normalizedPosition = 0;
+		int valueStart = keyMatch.getEndIndex();
 
-        for (int i = 0; i < originalText.length(); i++) {
+		if (valueStart >= column.length()) {
 
-            char c = originalText.charAt(i);
+			return null;
+		}
 
-            if (Character.isWhitespace(c) || c == '-' || c == '_' || c == '%') {
+		String valuePart = column.substring(valueStart);
 
-                continue;
-            }
+		/*
+		 * Find next requested key.
+		 */
 
-            normalizedPosition++;
+		KeyMatch nextKey = findNextKey(valuePart, allKeys);
 
-            if (normalizedPosition == normalizedEnd) {
+		if (nextKey != null) {
 
-                int end = i + 1;
+			valuePart = valuePart.substring(0, nextKey.getStartIndex());
+		}
 
-                /*
-                 * Include spaces / % / formatting immediately after the key.
-                 */
-                while (end < originalText.length()) {
+		valuePart = cleanValue(valuePart);
 
-                    char next = originalText.charAt(end);
+		String value = extractNumber(valuePart);
 
-                    if (Character.isWhitespace(next) || next == '-' || next == '_' || next == '%') {
+		if (value != null) {
 
-                        end++;
+			return value;
+		}
 
-                    } else {
+		return null;
+	}
 
-                        break;
-                    }
-                }
+	/*
+	 * ============================================================ FIND KEY MATCH
+	 * ============================================================
+	 */
 
-                return end;
-            }
-        }
+	private KeyMatch findKeyMatch(String text, String key) {
 
-        return originalText.length();
-    }
+		if (text == null || text.isBlank() || key == null || key.isBlank()) {
 
-    /*
-     * ============================================================ CLEAN KEY
-     * ============================================================
-     */
+			return null;
+		}
 
-    private String cleanKey(String key) {
+		String normalizedText = normalizeForKeyMatching(text);
 
-        if (key == null) {
+		String normalizedKey = normalizeForKeyMatching(key);
 
-            return "";
-        }
+		if (normalizedText.isEmpty() || normalizedKey.isEmpty()) {
 
-        String cleaned = key.trim().replace("\"", "");
+			return null;
+		}
 
-        if (cleaned.startsWith("[")) {
+		int normalizedStart = normalizedText.indexOf(normalizedKey);
 
-            cleaned = cleaned.substring(1);
-        }
+		if (normalizedStart < 0) {
 
-        if (cleaned.endsWith("]")) {
+			return null;
+		}
 
-            cleaned = cleaned.substring(0, cleaned.length() - 1);
-        }
+		int normalizedEnd = normalizedStart + normalizedKey.length();
 
-        return cleaned.trim();
-    }
+		int originalStart = mapNormalizedIndexToOriginal(text, normalizedStart);
 
-    /*
-     * ============================================================ CLEAN KEYS
-     * ============================================================
-     */
+		int originalEnd = mapNormalizedEndToOriginal(text, normalizedEnd);
 
-    private List<String> cleanKeys(List<String> keys) {
+		if (originalStart < 0 || originalEnd < 0) {
 
-        List<String> result = new ArrayList<>();
+			return null;
+		}
 
-        for (String key : keys) {
+		return new KeyMatch(originalStart, originalEnd, key);
+	}
 
-            String cleaned = cleanKey(key);
+	/*
+	 * ============================================================ FIND NEXT KEY
+	 * ============================================================
+	 */
 
-            if (!cleaned.isEmpty() && !result.contains(cleaned)) {
+	private KeyMatch findNextKey(String text, List<String> allKeys) {
 
-                result.add(cleaned);
-            }
-        }
+		if (text == null || text.isBlank() || allKeys == null || allKeys.isEmpty()) {
 
-        return result;
-    }
+			return null;
+		}
 
-    /*
-     * ============================================================ NORMALIZE OCR
-     * TEXT ============================================================
-     */
+		KeyMatch nearest = null;
 
-    private String normalizeOCRText(String text) {
+		for (String key : allKeys) {
 
-        if (text == null) {
+			if (key == null || key.isBlank()) {
 
-            return "";
-        }
+				continue;
+			}
 
-        return text.replace("\u00A0", " ").replace("\r\n", "\n").replace("\r", "\n").trim();
-    }
+			KeyMatch match = findKeyMatch(text, key);
 
-    /*
-     * ============================================================ KEY POSITION
-     * ============================================================
-     */
+			if (match == null) {
 
-    private static class KeyPosition {
+				continue;
+			}
 
-        private final int index;
+			if (nearest == null || match.getStartIndex() < nearest.getStartIndex()) {
 
-        private final String key;
+				nearest = match;
+			}
+		}
 
-        private KeyPosition(int index, String key) {
+		return nearest;
+	}
 
-            this.index = index;
-            this.key = key;
-        }
+	/*
+	 * ============================================================ FIND ALL KEY
+	 * POSITIONS ============================================================
+	 */
 
-        private int getIndex() {
+	private List<KeyPosition> findAllKeyPositions(String text, List<String> keys) {
 
-            return index;
-        }
+		List<KeyPosition> positions = new ArrayList<>();
 
-        @SuppressWarnings("unused")
-        private String getKey() {
+		if (text == null || text.isBlank() || keys == null || keys.isEmpty()) {
 
-            return key;
-        }
-    }
+			return positions;
+		}
 
-    /*
-     * ============================================================ KEY MATCH
-     * ============================================================
-     */
+		String normalizedText = normalizeForKeyMatching(text);
 
-    private static class KeyMatch {
+		for (String key : keys) {
 
-        private final int startIndex;
+			if (key == null || key.isBlank()) {
 
-        private final int endIndex;
+				continue;
+			}
 
-        private final String key;
+			String normalizedKey = normalizeForKeyMatching(key);
 
-        private KeyMatch(int startIndex, int endIndex, String key) {
+			int searchFrom = 0;
 
-            this.startIndex = startIndex;
+			while (searchFrom < normalizedText.length()) {
 
-            this.endIndex = endIndex;
+				int normalizedIndex = normalizedText.indexOf(normalizedKey, searchFrom);
 
-            this.key = key;
-        }
+				if (normalizedIndex < 0) {
 
-        private int getStartIndex() {
+					break;
+				}
 
-            return startIndex;
-        }
+				int originalIndex = mapNormalizedIndexToOriginal(text, normalizedIndex);
 
-        private int getEndIndex() {
+				if (originalIndex >= 0) {
 
-            return endIndex;
-        }
+					positions.add(new KeyPosition(originalIndex, key));
+				}
 
-        @SuppressWarnings("unused")
-        private String getKey() {
+				searchFrom = normalizedIndex + normalizedKey.length();
+			}
+		}
 
-            return key;
-        }
-    }
+		return positions;
+	}
+
+	/*
+	 * ============================================================ REMOVE DUPLICATE
+	 * POSITIONS ============================================================
+	 */
+
+	private List<KeyPosition> removeDuplicatePositions(List<KeyPosition> positions) {
+
+		List<KeyPosition> result = new ArrayList<>();
+
+		int previousIndex = -1;
+
+		for (KeyPosition position : positions) {
+
+			if (position.getIndex() == previousIndex) {
+
+				continue;
+			}
+
+			result.add(position);
+
+			previousIndex = position.getIndex();
+		}
+
+		return result;
+	}
+
+	/*
+	 * ============================================================ NEXT LINE
+	 * FALLBACK ============================================================
+	 */
+
+	private void extractValuesFromNextLines(String[] lines, List<String> keys, Map<String, String> result) {
+
+		if (lines == null || lines.length == 0) {
+
+			return;
+		}
+
+		for (int i = 0; i < lines.length; i++) {
+
+			String line = lines[i];
+
+			if (line == null || line.isBlank()) {
+
+				continue;
+			}
+
+			for (String key : keys) {
+
+				if (result.containsKey(key)) {
+
+					continue;
+				}
+
+				KeyMatch keyMatch = findKeyMatch(line, key);
+
+				if (keyMatch == null) {
+
+					continue;
+				}
+
+				String afterKey = line.substring(keyMatch.getEndIndex());
+
+				afterKey = cleanValue(afterKey);
+
+				String value = extractNumber(afterKey);
+
+				if (value != null) {
+
+					result.put(key, value);
+
+					continue;
+				}
+
+				/*
+				 * Search following lines.
+				 */
+
+				for (int j = i + 1; j < lines.length; j++) {
+
+					String nextLine = lines[j];
+
+					if (nextLine == null || nextLine.isBlank()) {
+
+						continue;
+					}
+
+					/*
+					 * Don't take another key's value.
+					 */
+
+					if (containsAnyKey(nextLine, keys)) {
+
+						break;
+					}
+
+					value = extractNumber(cleanValue(nextLine));
+
+					if (value != null) {
+
+						result.put(key, value);
+
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	/*
+	 * ============================================================ CHECK ANY KEY
+	 * ============================================================
+	 */
+
+	private boolean containsAnyKey(String line, List<String> keys) {
+
+		if (line == null || line.isBlank()) {
+
+			return false;
+		}
+
+		for (String key : keys) {
+
+			if (findKeyMatch(line, key) != null) {
+
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/*
+	 * ============================================================ EXTRACT NUMBER
+	 * ============================================================
+	 */
+
+	private String extractNumber(String text) {
+
+		if (text == null || text.isBlank()) {
+
+			return null;
+		}
+
+		Matcher matcher = NUMBER_PATTERN.matcher(text);
+
+		if (matcher.find()) {
+
+			return matcher.group();
+		}
+
+		return null;
+	}
+
+	/*
+	 * ============================================================ CLEAN VALUE
+	 * ============================================================
+	 */
+
+	private String cleanValue(String value) {
+
+		if (value == null) {
+
+			return "";
+		}
+
+		String result = value.trim();
+
+		result = result.replaceFirst("^[\\s:=\\-–—|]+", "").trim();
+
+		result = removeLHFlag(result);
+
+		result = result.replaceFirst("^[\\s:=\\-–—|]+", "").trim();
+
+		return result;
+	}
+
+	/*
+	 * ============================================================ REMOVE H / L
+	 * FLAG ============================================================
+	 */
+
+	private String removeLHFlag(String text) {
+
+		if (text == null) {
+
+			return "";
+		}
+
+		String result = text.trim();
+
+		while (true) {
+
+			String updated = result.replaceFirst("(?i)^[HL](?:\\s*[:=\\-–—|])?\\s*", "").trim();
+
+			if (updated.equals(result)) {
+
+				break;
+			}
+
+			result = updated;
+		}
+
+		return result;
+	}
+
+	/*
+	 * ============================================================ NORMALIZE KEY
+	 * ============================================================
+	 */
+
+	private String normalizeForKeyMatching(String text) {
+
+		if (text == null) {
+
+			return "";
+		}
+
+		return text.toLowerCase().replaceAll("[\\s\\-_\\%]+", "");
+	}
+
+	/*
+	 * ============================================================ MAP NORMALIZED
+	 * START TO ORIGINAL
+	 * ============================================================
+	 */
+
+	private int mapNormalizedIndexToOriginal(String originalText, int normalizedIndex) {
+
+		int normalizedPosition = 0;
+
+		for (int i = 0; i < originalText.length(); i++) {
+
+			char c = originalText.charAt(i);
+
+			if (Character.isWhitespace(c) || c == '-' || c == '_' || c == '%') {
+
+				continue;
+			}
+
+			if (normalizedPosition == normalizedIndex) {
+
+				return i;
+			}
+
+			normalizedPosition++;
+		}
+
+		return -1;
+	}
+
+	/*
+	 * ============================================================ MAP NORMALIZED
+	 * END TO ORIGINAL ============================================================
+	 */
+
+	private int mapNormalizedEndToOriginal(String originalText, int normalizedEnd) {
+
+		int normalizedPosition = 0;
+
+		for (int i = 0; i < originalText.length(); i++) {
+
+			char c = originalText.charAt(i);
+
+			if (Character.isWhitespace(c) || c == '-' || c == '_' || c == '%') {
+
+				continue;
+			}
+
+			normalizedPosition++;
+
+			if (normalizedPosition == normalizedEnd) {
+
+				int end = i + 1;
+
+				/*
+				 * Include formatting immediately after key.
+				 */
+
+				while (end < originalText.length()) {
+
+					char next = originalText.charAt(end);
+
+					if (Character.isWhitespace(next) || next == '-' || next == '_' || next == '%') {
+
+						end++;
+
+					} else {
+
+						break;
+					}
+				}
+
+				return end;
+			}
+		}
+
+		return originalText.length();
+	}
+
+	/*
+	 * ============================================================ CLEAN KEY
+	 * ============================================================
+	 */
+
+	private String cleanKey(String key) {
+
+		if (key == null) {
+
+			return "";
+		}
+
+		String cleaned = key.trim().replace("\"", "");
+
+		if (cleaned.startsWith("[")) {
+
+			cleaned = cleaned.substring(1);
+		}
+
+		if (cleaned.endsWith("]")) {
+
+			cleaned = cleaned.substring(0, cleaned.length() - 1);
+		}
+
+		return cleaned.trim();
+	}
+
+	/*
+	 * ============================================================ CLEAN KEYS
+	 * ============================================================
+	 */
+
+	private List<String> cleanKeys(List<String> keys) {
+
+		List<String> result = new ArrayList<>();
+
+		for (String key : keys) {
+
+			String cleaned = cleanKey(key);
+
+			if (!cleaned.isEmpty() && !result.contains(cleaned)) {
+
+				result.add(cleaned);
+			}
+		}
+
+		return result;
+	}
+
+	/*
+	 * ============================================================ NORMALIZE OCR
+	 * TEXT ============================================================
+	 */
+
+	private String normalizeOCRText(String text) {
+
+		if (text == null) {
+
+			return "";
+		}
+
+		return text.replace("\u00A0", " ").replace("\r\n", "\n").replace("\r", "\n").trim();
+	}
+
+	/*
+	 * ============================================================ DIMENSION CLASS
+	 * ============================================================
+	 */
+
+	private static class Dimension {
+
+		private final int width;
+
+		private final int height;
+
+		private Dimension(int width, int height) {
+
+			this.width = width;
+
+			this.height = height;
+		}
+	}
+
+	/*
+	 * ============================================================ KEY POSITION
+	 * ============================================================
+	 */
+
+	private static class KeyPosition {
+
+		private final int index;
+
+		private final String key;
+
+		private KeyPosition(int index, String key) {
+
+			this.index = index;
+
+			this.key = key;
+		}
+
+		private int getIndex() {
+
+			return index;
+		}
+
+		@SuppressWarnings("unused")
+		private String getKey() {
+
+			return key;
+		}
+	}
+
+	/*
+	 * ============================================================ KEY MATCH
+	 * ============================================================
+	 */
+
+	private static class KeyMatch {
+
+		private final int startIndex;
+
+		private final int endIndex;
+
+		private final String key;
+
+		private KeyMatch(int startIndex, int endIndex, String key) {
+
+			this.startIndex = startIndex;
+
+			this.endIndex = endIndex;
+
+			this.key = key;
+		}
+
+		private int getStartIndex() {
+
+			return startIndex;
+		}
+
+		private int getEndIndex() {
+
+			return endIndex;
+		}
+
+		@SuppressWarnings("unused")
+		private String getKey() {
+
+			return key;
+		}
+	}
 }
