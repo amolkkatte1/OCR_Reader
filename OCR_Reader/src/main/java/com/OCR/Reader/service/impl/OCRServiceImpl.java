@@ -5,7 +5,6 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -42,34 +41,48 @@ public class OCRServiceImpl implements OCRService {
 	 * ============================================================ IMAGE LIMITS
 	 * ============================================================
 	 *
-	 * Maximum dimension: 2500 x 2500
+	 * Maximum image dimension:
 	 *
-	 * Maximum processed image size: 500 KB
+	 * 768 x 768
 	 *
-	 * These limits are applied BEFORE OCR.
-	 * ============================================================
+	 * IMPORTANT: We do NOT force the image to exactly 768 x 768.
+	 *
+	 * Aspect ratio is preserved.
+	 *
+	 * Examples:
+	 *
+	 * 3024 x 4032 -> 576 x 768 4032 x 3024 -> 768 x 576 768 x 768 -> 768 x 768 500
+	 * x 800 -> 480 x 768
 	 */
 
-	private static final int MAX_IMAGE_DIMENSION = 2500;
+	private static final int MAX_IMAGE_DIMENSION = 768;
 
+	/*
+	 * Maximum processed image size.
+	 *
+	 * This is used only for JPEG compression.
+	 */
 	private static final long MAX_IMAGE_SIZE = 500L * 1024L; // 500 KB
 
 	/*
 	 * JPEG compression settings.
-	 *
-	 * Start with good quality. If image is still > 500 KB, quality is reduced
-	 * gradually.
 	 */
 	private static final float JPEG_QUALITY_START = 0.85f;
-
 	private static final float JPEG_QUALITY_MIN = 0.55f;
 
 	/*
-	 * ============================================================ NUMBER PATTERN
+	 * Number extraction pattern.
+	 *
+	 * Examples:
+	 *
+	 * 12 12.5 -12.5 +12.5 .5
+	 */
+	private static final Pattern NUMBER_PATTERN = Pattern.compile("[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)");
+
+	/*
+	 * ============================================================ MAIN OCR METHOD
 	 * ============================================================
 	 */
-
-	private static final Pattern NUMBER_PATTERN = Pattern.compile("[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)");
 
 	@Override
 	public OCRResult processImage(MultipartFile file, List<String> keys, int columnCount) {
@@ -86,9 +99,7 @@ public class OCRServiceImpl implements OCRService {
 			 */
 
 			if (file == null || file.isEmpty()) {
-
 				result.setStatus(AppConstants.ERROR);
-
 				return result;
 			}
 
@@ -98,9 +109,7 @@ public class OCRServiceImpl implements OCRService {
 			 */
 
 			if (keys == null || keys.isEmpty()) {
-
 				result.setStatus(AppConstants.ERROR);
-
 				return result;
 			}
 
@@ -110,31 +119,26 @@ public class OCRServiceImpl implements OCRService {
 			 */
 
 			if (columnCount < 1) {
-
 				columnCount = 1;
 			}
 
 			/*
 			 * ---------------------------------------------------- IMAGE PREPROCESSING
-			 *
-			 * Existing logic:
-			 *
-			 * MultipartFile -> temporary image -> OCR
-			 *
-			 * New preprocessing:
-			 *
-			 * MultipartFile -> check dimensions -> resize if required -> compress if
-			 * required -> temporary JPG -> OCR
 			 * ----------------------------------------------------
+			 *
+			 * MultipartFile -> dimension check -> proportional resize if required -> JPEG
+			 * compression if required -> temporary file
 			 */
 
 			tempFile = preprocessImage(file);
 
 			/*
 			 * ---------------------------------------------------- OCR
-			 *
-			 * Your existing OCR logic is unchanged.
 			 * ----------------------------------------------------
+			 *
+			 * OCRProcessor is intentionally created per request.
+			 *
+			 * This keeps your existing concurrent-request behavior.
 			 */
 
 			OCRProcessor ocrProcessor = new OCRProcessor();
@@ -142,14 +146,13 @@ public class OCRServiceImpl implements OCRService {
 			String extractedText = ocrProcessor.extractTextFromImage(tempFile);
 
 			/*
-			 * ---------------------------------------------------- EXISTING KEY/VALUE
-			 * EXTRACTION ----------------------------------------------------
+			 * ---------------------------------------------------- KEY / VALUE EXTRACTION
+			 * ----------------------------------------------------
 			 */
 
 			Map<String, String> keyValues = extractKeyValues(extractedText, keys, columnCount);
 
 			result.setData(keyValues);
-
 			result.setStatus(AppConstants.SUCCESS);
 
 		} catch (IOException e) {
@@ -171,13 +174,7 @@ public class OCRServiceImpl implements OCRService {
 			 * IMAGE ----------------------------------------------------
 			 */
 
-			if (tempFile != null && tempFile.exists()) {
-
-				if (!tempFile.delete()) {
-
-					log.warn("Unable to delete temp file: {}", tempFile.getAbsolutePath());
-				}
-			}
+			deleteTempFile(tempFile);
 		}
 
 		return result;
@@ -189,24 +186,17 @@ public class OCRServiceImpl implements OCRService {
 	 *
 	 * Rules:
 	 *
-	 * Image <= 500 KB AND dimensions <= 2500
+	 * 1. Dimension <= 768 AND size <= 500 KB -> use original image as-is
 	 *
-	 * -> use image as-is
+	 * 2. Dimension > 768 -> proportional resize
 	 *
+	 * 3. Size > 500 KB -> JPEG compression
 	 *
-	 * Image > 500 KB -> compress
+	 * 4. Dimension > 768 AND size > 500 KB -> resize + compress
 	 *
+	 * 768 = PIXEL LIMIT
 	 *
-	 * Width OR height > 2500 -> proportional resize
-	 *
-	 *
-	 * Always:
-	 *
-	 * -> temporary JPG -> OCR -> delete
-	 *
-	 * For very large images we use ImageIO subsampling so that the original huge
-	 * image is not fully decoded into memory.
-	 * ============================================================
+	 * 500 KB = FILE SIZE LIMIT
 	 */
 
 	private File preprocessImage(MultipartFile file) throws IOException {
@@ -217,10 +207,9 @@ public class OCRServiceImpl implements OCRService {
 
 			/*
 			 * ---------------------------------------------------- STEP 1 READ ORIGINAL
-			 * IMAGE DIMENSIONS
+			 * DIMENSIONS ----------------------------------------------------
 			 *
-			 * We do NOT fully decode the image here.
-			 * ----------------------------------------------------
+			 * Do not fully decode image here.
 			 */
 
 			int originalWidth;
@@ -230,14 +219,12 @@ public class OCRServiceImpl implements OCRService {
 					ImageInputStream imageInputStream = ImageIO.createImageInputStream(inputStream)) {
 
 				if (imageInputStream == null) {
-
 					throw new IOException("Unable to create image input stream");
 				}
 
 				var readers = ImageIO.getImageReaders(imageInputStream);
 
 				if (!readers.hasNext()) {
-
 					throw new IOException("Unsupported image format");
 				}
 
@@ -248,7 +235,6 @@ public class OCRServiceImpl implements OCRService {
 					reader.setInput(imageInputStream, true, true);
 
 					originalWidth = reader.getWidth(0);
-
 					originalHeight = reader.getHeight(0);
 
 				} finally {
@@ -260,16 +246,10 @@ public class OCRServiceImpl implements OCRService {
 			log.info("Original image: {}x{}, size={} KB", originalWidth, originalHeight, file.getSize() / 1024);
 
 			/*
-			 * ---------------------------------------------------- STEP 2
+			 * ---------------------------------------------------- STEP 2 IMAGE ALREADY
+			 * WITHIN LIMITS ----------------------------------------------------
 			 *
-			 * If image is already within both limits:
-			 *
-			 * dimensions <= 2500 size <= 500 KB
-			 *
-			 * use original image.
-			 *
-			 * We still copy it to a temporary file.
-			 * ----------------------------------------------------
+			 * Keep original image.
 			 */
 
 			if (originalWidth <= MAX_IMAGE_DIMENSION && originalHeight <= MAX_IMAGE_DIMENSION
@@ -277,27 +257,27 @@ public class OCRServiceImpl implements OCRService {
 
 				file.transferTo(tempFile);
 
-				log.info("Image accepted as-is: {} KB", tempFile.length() / 1024);
+				log.info("Image accepted as-is: {}x{}, size={} KB", originalWidth, originalHeight,
+						tempFile.length() / 1024);
 
 				return tempFile;
 			}
 
 			/*
 			 * ---------------------------------------------------- STEP 3 CALCULATE TARGET
-			 * DIMENSIONS
+			 * DIMENSIONS ----------------------------------------------------
 			 *
-			 * Keep original aspect ratio.
-			 * ----------------------------------------------------
+			 * Maximum dimension = 768.
+			 *
+			 * Aspect ratio preserved.
 			 */
 
 			int targetWidth = originalWidth;
-
 			int targetHeight = originalHeight;
 
 			if (originalWidth > MAX_IMAGE_DIMENSION || originalHeight > MAX_IMAGE_DIMENSION) {
 
 				double scale = Math.min((double) MAX_IMAGE_DIMENSION / originalWidth,
-
 						(double) MAX_IMAGE_DIMENSION / originalHeight);
 
 				targetWidth = Math.max(1, (int) Math.round(originalWidth * scale));
@@ -305,20 +285,13 @@ public class OCRServiceImpl implements OCRService {
 				targetHeight = Math.max(1, (int) Math.round(originalHeight * scale));
 			}
 
+			log.info("Target image dimensions: {}x{}", targetWidth, targetHeight);
+
 			/*
-			 * ---------------------------------------------------- STEP 4 CALCULATE IMAGEIO
-			 * SUBSAMPLING
+			 * ---------------------------------------------------- STEP 4 IMAGEIO
+			 * SUBSAMPLING ----------------------------------------------------
 			 *
-			 * This reduces memory consumption for huge images.
-			 *
-			 * Example:
-			 *
-			 * Original: 6000 x 8000
-			 *
-			 * Target: 1875 x 2500
-			 *
-			 * ImageIO reads a reduced version instead of first creating a full 6000 x 8000
-			 * BufferedImage. ----------------------------------------------------
+			 * Reduces memory usage for large camera images.
 			 */
 
 			int sampleX = Math.max(1, (int) Math.floor((double) originalWidth / targetWidth));
@@ -328,8 +301,8 @@ public class OCRServiceImpl implements OCRService {
 			int sample = Math.min(sampleX, sampleY);
 
 			/*
-			 * ---------------------------------------------------- STEP 5 READ IMAGE USING
-			 * SUBSAMPLING ----------------------------------------------------
+			 * ---------------------------------------------------- STEP 5 READ IMAGE
+			 * ----------------------------------------------------
 			 */
 
 			BufferedImage image;
@@ -338,14 +311,12 @@ public class OCRServiceImpl implements OCRService {
 					ImageInputStream imageInputStream = ImageIO.createImageInputStream(inputStream)) {
 
 				if (imageInputStream == null) {
-
 					throw new IOException("Unable to create image input stream");
 				}
 
 				var readers = ImageIO.getImageReaders(imageInputStream);
 
 				if (!readers.hasNext()) {
-
 					throw new IOException("Unsupported image format");
 				}
 
@@ -358,7 +329,6 @@ public class OCRServiceImpl implements OCRService {
 					javax.imageio.ImageReadParam param = reader.getDefaultReadParam();
 
 					if (sample > 1) {
-
 						param.setSourceSubsampling(sample, sample, 0, 0);
 					}
 
@@ -371,26 +341,23 @@ public class OCRServiceImpl implements OCRService {
 			}
 
 			if (image == null) {
-
 				throw new IOException("Unable to decode image");
 			}
 
 			/*
-			 * ---------------------------------------------------- STEP 6
+			 * ---------------------------------------------------- STEP 6 FINAL RESIZE
+			 * ----------------------------------------------------
 			 *
 			 * Subsampling uses integer values.
 			 *
-			 * Therefore the resulting image can occasionally still be slightly greater than
-			 * 2500 px.
+			 * Therefore decoded image may still be larger than 768px.
 			 *
-			 * Resize again if necessary.
-			 * ----------------------------------------------------
+			 * Resize only when actually required.
 			 */
 
 			if (image.getWidth() > MAX_IMAGE_DIMENSION || image.getHeight() > MAX_IMAGE_DIMENSION) {
 
 				double scale = Math.min((double) MAX_IMAGE_DIMENSION / image.getWidth(),
-
 						(double) MAX_IMAGE_DIMENSION / image.getHeight());
 
 				int finalWidth = Math.max(1, (int) Math.round(image.getWidth() * scale));
@@ -400,17 +367,16 @@ public class OCRServiceImpl implements OCRService {
 				BufferedImage resized = resizeImage(image, finalWidth, finalHeight);
 
 				image.flush();
-
 				image = resized;
 			}
 
 			/*
 			 * ---------------------------------------------------- STEP 7 CONVERT TO RGB
-			 *
-			 * This handles PNG/transparent images.
-			 *
-			 * White background is used for OCR.
 			 * ----------------------------------------------------
+			 *
+			 * Handles PNG / transparency.
+			 *
+			 * White background is used.
 			 */
 
 			if (image.getType() != BufferedImage.TYPE_INT_RGB) {
@@ -420,34 +386,34 @@ public class OCRServiceImpl implements OCRService {
 
 				Graphics2D graphics = rgbImage.createGraphics();
 
-				graphics.setColor(Color.WHITE);
+				try {
 
-				graphics.fillRect(0, 0, image.getWidth(), image.getHeight());
+					graphics.setColor(Color.WHITE);
 
-				graphics.drawImage(image, 0, 0, null);
+					graphics.fillRect(0, 0, image.getWidth(), image.getHeight());
 
-				graphics.dispose();
+					graphics.drawImage(image, 0, 0, null);
+
+				} finally {
+
+					graphics.dispose();
+				}
 
 				image.flush();
-
 				image = rgbImage;
 			}
 
 			/*
 			 * ---------------------------------------------------- STEP 8 WRITE JPEG
+			 * ----------------------------------------------------
 			 *
-			 * Start with quality 0.85.
+			 * Start quality = 0.85.
 			 *
 			 * If > 500 KB:
 			 *
 			 * 0.80 0.75 0.70 ...
 			 *
-			 * until:
-			 *
-			 * <= 500 KB
-			 *
-			 * or minimum quality is reached.
-			 * ----------------------------------------------------
+			 * Minimum = 0.55
 			 */
 
 			writeCompressedJpeg(image, tempFile, JPEG_QUALITY_START);
@@ -459,7 +425,6 @@ public class OCRServiceImpl implements OCRService {
 				quality -= 0.05f;
 
 				if (quality < JPEG_QUALITY_MIN) {
-
 					quality = JPEG_QUALITY_MIN;
 				}
 
@@ -467,7 +432,7 @@ public class OCRServiceImpl implements OCRService {
 			}
 
 			/*
-			 * ---------------------------------------------------- LOG FINAL IMAGE
+			 * ---------------------------------------------------- FINAL LOG
 			 * ----------------------------------------------------
 			 */
 
@@ -485,17 +450,7 @@ public class OCRServiceImpl implements OCRService {
 
 		} catch (Exception e) {
 
-			/*
-			 * If preprocessing fails, remove temporary file.
-			 */
-
-			if (tempFile.exists()) {
-
-				if (!tempFile.delete()) {
-
-					log.warn("Unable to delete temporary preprocessing file: {}", tempFile.getAbsolutePath());
-				}
-			}
+			deleteTempFile(tempFile);
 
 			throw e;
 		}
@@ -505,8 +460,7 @@ public class OCRServiceImpl implements OCRService {
 	 * ============================================================ RESIZE IMAGE
 	 * ============================================================
 	 *
-	 * Aspect ratio is already calculated by caller.
-	 * ============================================================
+	 * Aspect ratio is calculated by caller.
 	 */
 
 	private BufferedImage resizeImage(BufferedImage source, int width, int height) {
@@ -515,27 +469,24 @@ public class OCRServiceImpl implements OCRService {
 
 		Graphics2D graphics = resized.createGraphics();
 
-		graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+		try {
 
-		graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
+			graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
-		graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+			graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
 
-		/*
-		 * White background.
-		 */
+			graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
-		graphics.setColor(Color.WHITE);
+			graphics.setColor(Color.WHITE);
 
-		graphics.fillRect(0, 0, width, height);
+			graphics.fillRect(0, 0, width, height);
 
-		/*
-		 * Draw resized image.
-		 */
+			graphics.drawImage(source, 0, 0, width, height, null);
 
-		graphics.drawImage(source, 0, 0, width, height, null);
+		} finally {
 
-		graphics.dispose();
+			graphics.dispose();
+		}
 
 		return resized;
 	}
@@ -554,7 +505,6 @@ public class OCRServiceImpl implements OCRService {
 			var writers = ImageIO.getImageWritersByFormatName("jpg");
 
 			if (!writers.hasNext()) {
-
 				throw new IOException("JPEG writer not available");
 			}
 
@@ -583,7 +533,6 @@ public class OCRServiceImpl implements OCRService {
 		} finally {
 
 			if (writer != null) {
-
 				writer.dispose();
 			}
 		}
@@ -606,7 +555,6 @@ public class OCRServiceImpl implements OCRService {
 		List<String> cleanedKeys = cleanKeys(keys);
 
 		if (cleanedKeys.isEmpty()) {
-
 			return result;
 		}
 
@@ -615,30 +563,12 @@ public class OCRServiceImpl implements OCRService {
 		String[] lines = text.split("\\r?\\n");
 
 		/*
-		 * -------------------------------------------------------- IMPORTANT
-		 *
 		 * Every requested key searches ALL columns.
-		 *
-		 * Example:
-		 *
-		 * columnCount = 3
-		 *
-		 * WBC 7.2 HGB 13.5 RBC 4.27
-		 *
-		 * WBC -> column 1 HGB -> column 2 RBC -> column 3
-		 *
-		 * But we do NOT assume this.
-		 *
-		 * Every key searches:
-		 *
-		 * column 1 column 2 column 3
-		 * --------------------------------------------------------
 		 */
 
 		for (String key : cleanedKeys) {
 
 			if (result.containsKey(key)) {
-
 				continue;
 			}
 
@@ -655,7 +585,7 @@ public class OCRServiceImpl implements OCRService {
 		}
 
 		/*
-		 * Final fallback for values that appear on the following OCR line.
+		 * Final fallback: value may exist on next OCR line.
 		 */
 
 		extractValuesFromNextLines(lines, cleanedKeys, result);
@@ -686,10 +616,6 @@ public class OCRServiceImpl implements OCRService {
 				continue;
 			}
 
-			/*
-			 * Create exactly the logical columns from this OCR line.
-			 */
-
 			List<String> columns = createColumns(line, allKeys, columnCount);
 
 			log.debug("OCR LINE: [{}]", line);
@@ -697,7 +623,7 @@ public class OCRServiceImpl implements OCRService {
 			log.debug("COLUMNS: {}", columns);
 
 			/*
-			 * SEARCH KEY IN EVERY COLUMN
+			 * Search key in every column.
 			 */
 
 			for (int i = 0; i < columns.size(); i++) {
@@ -723,13 +649,6 @@ public class OCRServiceImpl implements OCRService {
 		/*
 		 * -------------------------------------------------------- COMPLETE LINE
 		 * FALLBACK --------------------------------------------------------
-		 *
-		 * Example:
-		 *
-		 * WBC 7.2 HGB 13.5 RBC 4.27
-		 *
-		 * If column detection fails, search complete OCR line.
-		 * --------------------------------------------------------
 		 */
 
 		for (String line : lines) {
@@ -766,6 +685,10 @@ public class OCRServiceImpl implements OCRService {
 
 		String text = line.trim();
 
+		/*
+		 * Single column.
+		 */
+
 		if (columnCount <= 1) {
 
 			columns.add(text);
@@ -776,13 +699,7 @@ public class OCRServiceImpl implements OCRService {
 		/*
 		 * -------------------------------------------------------- FIRST METHOD
 		 *
-		 * Find all requested keys in the line.
-		 *
-		 * Example:
-		 *
-		 * WBC 7.2 HGB 13.5 RBC 4.27
-		 *
-		 * Create a column from one key to next key.
+		 * Find requested keys and create column from one key until the next key.
 		 * --------------------------------------------------------
 		 */
 
@@ -794,36 +711,9 @@ public class OCRServiceImpl implements OCRService {
 
 		if (!uniquePositions.isEmpty()) {
 
-			for (int i = 0; i < uniquePositions.size(); i++) {
-
-				int start = uniquePositions.get(i).getIndex();
-
-				int end = text.length();
-
-				if (i + 1 < uniquePositions.size()) {
-
-					end = uniquePositions.get(i + 1).getIndex();
-				}
-
-				if (start >= end) {
-
-					continue;
-				}
-
-				String column = text.substring(start, end).trim();
-
-				if (!column.isEmpty()) {
-
-					columns.add(column);
-				}
-			}
-
-			/*
-			 * If we found expected number of columns, return them.
-			 */
+			addColumnsFromKeyPositions(text, uniquePositions, columns);
 
 			if (columns.size() == columnCount) {
-
 				return columns;
 			}
 		}
@@ -831,9 +721,7 @@ public class OCRServiceImpl implements OCRService {
 		/*
 		 * -------------------------------------------------------- SECOND METHOD
 		 *
-		 * OCR normally puts large spaces between columns.
-		 *
-		 * Split on 3 or more spaces.
+		 * OCR normally creates larger spaces between columns.
 		 * --------------------------------------------------------
 		 */
 
@@ -850,14 +738,13 @@ public class OCRServiceImpl implements OCRService {
 		}
 
 		if (columns.size() == columnCount) {
-
 			return columns;
 		}
 
 		/*
 		 * -------------------------------------------------------- THIRD METHOD
 		 *
-		 * If OCR has inconsistent spacing, use detected key positions again.
+		 * Use detected key positions again.
 		 * --------------------------------------------------------
 		 */
 
@@ -865,32 +752,13 @@ public class OCRServiceImpl implements OCRService {
 
 			columns.clear();
 
-			for (int i = 0; i < uniquePositions.size(); i++) {
-
-				int start = uniquePositions.get(i).getIndex();
-
-				int end = text.length();
-
-				if (i + 1 < uniquePositions.size()) {
-
-					end = uniquePositions.get(i + 1).getIndex();
-				}
-
-				String column = text.substring(start, end).trim();
-
-				if (!column.isEmpty()) {
-
-					columns.add(column);
-				}
-			}
+			addColumnsFromKeyPositions(text, uniquePositions, columns);
 
 			return columns;
 		}
 
 		/*
 		 * -------------------------------------------------------- LAST FALLBACK
-		 *
-		 * Treat complete line as one column.
 		 * --------------------------------------------------------
 		 */
 
@@ -899,6 +767,37 @@ public class OCRServiceImpl implements OCRService {
 		columns.add(text);
 
 		return columns;
+	}
+
+	/*
+	 * ============================================================ ADD COLUMNS
+	 * USING KEY POSITIONS
+	 * ============================================================
+	 */
+
+	private void addColumnsFromKeyPositions(String text, List<KeyPosition> positions, List<String> columns) {
+
+		for (int i = 0; i < positions.size(); i++) {
+
+			int start = positions.get(i).getIndex();
+
+			int end = text.length();
+
+			if (i + 1 < positions.size()) {
+
+				end = positions.get(i + 1).getIndex();
+			}
+
+			if (start >= end) {
+				continue;
+			}
+
+			String column = text.substring(start, end).trim();
+
+			if (!column.isEmpty()) {
+				columns.add(column);
+			}
+		}
 	}
 
 	/*
@@ -914,39 +813,25 @@ public class OCRServiceImpl implements OCRService {
 		}
 
 		/*
-		 * Find actual key position.
+		 * Find actual OCR key position.
 		 */
 
 		KeyMatch keyMatch = findKeyMatch(column, requestedKey);
 
 		if (keyMatch == null) {
-
 			return null;
 		}
-
-		/*
-		 * IMPORTANT:
-		 *
-		 * Use actual OCR end position.
-		 *
-		 * DO NOT use:
-		 *
-		 * key.length()
-		 */
 
 		int valueStart = keyMatch.getEndIndex();
 
 		if (valueStart >= column.length()) {
-
 			return null;
 		}
 
 		String valuePart = column.substring(valueStart);
 
 		/*
-		 * Find next requested key.
-		 *
-		 * This prevents taking numbers belonging to the next test.
+		 * Stop before next requested key.
 		 */
 
 		KeyMatch nextKey = findNextKey(valuePart, allKeys);
@@ -958,14 +843,7 @@ public class OCRServiceImpl implements OCRService {
 
 		valuePart = cleanValue(valuePart);
 
-		String value = extractNumber(valuePart);
-
-		if (value != null) {
-
-			return value;
-		}
-
-		return null;
+		return extractNumber(valuePart);
 	}
 
 	/*
@@ -992,7 +870,6 @@ public class OCRServiceImpl implements OCRService {
 		int normalizedStart = normalizedText.indexOf(normalizedKey);
 
 		if (normalizedStart < 0) {
-
 			return null;
 		}
 
@@ -1034,7 +911,6 @@ public class OCRServiceImpl implements OCRService {
 			KeyMatch match = findKeyMatch(text, key);
 
 			if (match == null) {
-
 				continue;
 			}
 
@@ -1061,6 +937,18 @@ public class OCRServiceImpl implements OCRService {
 			return positions;
 		}
 
+		/*
+		 * Normalize OCR text only once.
+		 *
+		 * This avoids recalculating the same normalized text for every requested key.
+		 */
+
+		String normalizedText = normalizeForKeyMatching(text);
+
+		if (normalizedText.isEmpty()) {
+			return positions;
+		}
+
 		for (String key : keys) {
 
 			if (key == null || key.isBlank()) {
@@ -1068,9 +956,11 @@ public class OCRServiceImpl implements OCRService {
 				continue;
 			}
 
-			String normalizedText = normalizeForKeyMatching(text);
-
 			String normalizedKey = normalizeForKeyMatching(key);
+
+			if (normalizedKey.isEmpty()) {
+				continue;
+			}
 
 			int searchFrom = 0;
 
@@ -1079,7 +969,6 @@ public class OCRServiceImpl implements OCRService {
 				int normalizedIndex = normalizedText.indexOf(normalizedKey, searchFrom);
 
 				if (normalizedIndex < 0) {
-
 					break;
 				}
 
@@ -1147,14 +1036,12 @@ public class OCRServiceImpl implements OCRService {
 			for (String key : keys) {
 
 				if (result.containsKey(key)) {
-
 					continue;
 				}
 
 				KeyMatch keyMatch = findKeyMatch(line, key);
 
 				if (keyMatch == null) {
-
 					continue;
 				}
 
@@ -1185,7 +1072,7 @@ public class OCRServiceImpl implements OCRService {
 					}
 
 					/*
-					 * Don't take another key's value.
+					 * Do not take another key's value.
 					 */
 
 					if (containsAnyKey(nextLine, keys)) {
@@ -1244,7 +1131,6 @@ public class OCRServiceImpl implements OCRService {
 		Matcher matcher = NUMBER_PATTERN.matcher(text);
 
 		if (matcher.find()) {
-
 			return matcher.group();
 		}
 
@@ -1259,7 +1145,6 @@ public class OCRServiceImpl implements OCRService {
 	private String cleanValue(String value) {
 
 		if (value == null) {
-
 			return "";
 		}
 
@@ -1280,14 +1165,12 @@ public class OCRServiceImpl implements OCRService {
 	 *
 	 * Examples:
 	 *
-	 * H: 12.5 -> 12.5 L: 10.2 -> 10.2 H 12.5 -> 12.5 L-12.5 -> 12.5
-	 * ============================================================
+	 * H: 12.5 L: 10.2 H 12.5 L-12.5
 	 */
 
 	private String removeLHFlag(String text) {
 
 		if (text == null) {
-
 			return "";
 		}
 
@@ -1295,10 +1178,9 @@ public class OCRServiceImpl implements OCRService {
 
 		while (true) {
 
-			String updated = result.replaceFirst("(?i)^[HL]\\s*[:=\\-–—|]?\\s*", "").trim();
+			String updated = result.replaceFirst("(?i)^[HL]\\s*[:=\\\\-–—|]?\\s*", "").trim();
 
 			if (updated.equals(result)) {
-
 				break;
 			}
 
@@ -1317,18 +1199,15 @@ public class OCRServiceImpl implements OCRService {
 	 * LYMPH% LYMPH % LYMPH-%
 	 *
 	 * RDW-CV RDW CV RDWCV
-	 *
-	 * ============================================================
 	 */
 
 	private String normalizeForKeyMatching(String text) {
 
 		if (text == null) {
-
 			return "";
 		}
 
-		return text.toLowerCase().replaceAll("[\\s\\\\\\-_%]+", "");
+		return text.toLowerCase().replaceAll("[\\s\\-_%]+", "");
 	}
 
 	/*
@@ -1386,7 +1265,7 @@ public class OCRServiceImpl implements OCRService {
 				int end = i + 1;
 
 				/*
-				 * Include spaces / % / formatting immediately after the key.
+				 * Include formatting characters immediately after the key.
 				 */
 
 				while (end < originalText.length()) {
@@ -1418,19 +1297,16 @@ public class OCRServiceImpl implements OCRService {
 	private String cleanKey(String key) {
 
 		if (key == null) {
-
 			return "";
 		}
 
 		String cleaned = key.trim().replace("\"", "");
 
 		if (cleaned.startsWith("[")) {
-
 			cleaned = cleaned.substring(1);
 		}
 
 		if (cleaned.endsWith("]")) {
-
 			cleaned = cleaned.substring(0, cleaned.length() - 1);
 		}
 
@@ -1467,11 +1343,28 @@ public class OCRServiceImpl implements OCRService {
 	private String normalizeOCRText(String text) {
 
 		if (text == null) {
-
 			return "";
 		}
 
 		return text.replace("\u00A0", " ").replace("\r\n", "\n").replace("\r", "\n").trim();
+	}
+
+	/*
+	 * ============================================================ DELETE TEMP FILE
+	 * ============================================================
+	 */
+
+	private void deleteTempFile(File tempFile) {
+
+		if (tempFile == null || !tempFile.exists()) {
+
+			return;
+		}
+
+		if (!tempFile.delete()) {
+
+			log.warn("Unable to delete temp file: {}", tempFile.getAbsolutePath());
+		}
 	}
 
 	/*
@@ -1482,24 +1375,20 @@ public class OCRServiceImpl implements OCRService {
 	private static class KeyPosition {
 
 		private final int index;
-
 		private final String key;
 
 		private KeyPosition(int index, String key) {
 
 			this.index = index;
-
 			this.key = key;
 		}
 
 		private int getIndex() {
-
 			return index;
 		}
 
 		@SuppressWarnings("unused")
 		private String getKey() {
-
 			return key;
 		}
 	}
@@ -1512,33 +1401,26 @@ public class OCRServiceImpl implements OCRService {
 	private static class KeyMatch {
 
 		private final int startIndex;
-
 		private final int endIndex;
-
 		private final String key;
 
 		private KeyMatch(int startIndex, int endIndex, String key) {
 
 			this.startIndex = startIndex;
-
 			this.endIndex = endIndex;
-
 			this.key = key;
 		}
 
 		private int getStartIndex() {
-
 			return startIndex;
 		}
 
 		private int getEndIndex() {
-
 			return endIndex;
 		}
 
 		@SuppressWarnings("unused")
 		private String getKey() {
-
 			return key;
 		}
 	}
