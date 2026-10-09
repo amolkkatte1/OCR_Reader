@@ -47,7 +47,7 @@ OUTPUT_PRICE_PER_MILLION = float(
 USD_TO_INR = float(os.getenv("USD_TO_INR", "88.0"))
 
 # Maximum OCR attempts allowed during this server process.
-MAX_API_CALLS = 1
+MAX_API_CALLS = 50
 
 # Counts admitted OCR requests, including requests that later fail.
 request_count = 0
