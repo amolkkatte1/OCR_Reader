@@ -552,15 +552,7 @@ async def handwriting_ocr(file: UploadFile = File(...)):
 
         total_elapsed = time.perf_counter() - request_start
 
-        result["data"]["image"] = {
-            "filename": file.filename,
-            "original_width": image_info["original_width"],
-            "original_height": image_info["original_height"],
-            "width_sent_to_gemini": image_info["width"],
-            "height_sent_to_gemini": image_info["height"],
-            "format": image_info["source_format"],
-            "processed_bytes": len(image_info["bytes"]),
-        }
+
 
 
         result["data"]["processing_seconds"] = round(total_elapsed, 3)
