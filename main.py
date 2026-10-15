@@ -527,7 +527,7 @@ async def handwriting_ocr(file: UploadFile = File(...)):
                         "or increase GEMINI_MAX_OUTPUT_TOKENS."
                     ),
                     "data": {},
-                    "gemini_usage": request_usage,
+
                 }
             )
 
@@ -545,7 +545,7 @@ async def handwriting_ocr(file: UploadFile = File(...)):
                         "Gemini returned invalid or incomplete JSON. "
                         "Check the response preview in server logs."
                     ),
-                    "gemini_usage": request_usage,
+
                     "data": {},
                 }
             )
@@ -562,7 +562,7 @@ async def handwriting_ocr(file: UploadFile = File(...)):
             "processed_bytes": len(image_info["bytes"]),
         }
 
-        result["data"]["gemini_usage"] = request_usage
+
         result["data"]["processing_seconds"] = round(total_elapsed, 3)
 
         logger.info(
